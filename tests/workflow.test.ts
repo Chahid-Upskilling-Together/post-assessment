@@ -20,6 +20,7 @@ import type {
   ReplyOutcome,
 } from "../src/types";
 import { cancelOpening, clientReply, fillOpeningWorkflow, getOpeningStatus, parseReply } from "../src/workflows";
+import { bundlerOptions } from "../src/bundler-options";
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -244,7 +245,7 @@ before(
     });
     [env, workflowBundle] = await Promise.all([
       TestWorkflowEnvironment.createTimeSkipping(),
-      bundleWorkflowCode({ workflowsPath: require.resolve("../src/workflows"), logger: new DefaultLogger("WARN") }),
+      bundleWorkflowCode({ workflowsPath: require.resolve("../src/workflows"), logger: new DefaultLogger("WARN"), ...bundlerOptions }),
     ]);
   },
   { timeout: 180_000 },

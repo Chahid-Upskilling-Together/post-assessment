@@ -1,5 +1,6 @@
 import { NativeConnection, Worker } from "@temporalio/worker";
 import * as activities from "./activities";
+import { bundlerOptions } from "./bundler-options";
 import { ensureSeeded } from "./store";
 
 async function run(): Promise<void> {
@@ -12,6 +13,7 @@ async function run(): Promise<void> {
     namespace: "default",
     taskQueue: "juniper-waitlist",
     workflowsPath: require.resolve("./workflows"),
+    bundlerOptions,
     activities,
   });
   console.log("Worker is polling the juniper-waitlist task queue.");

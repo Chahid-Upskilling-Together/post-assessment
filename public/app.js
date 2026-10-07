@@ -49,8 +49,14 @@ async function api(path, body) {
   return data;
 }
 
+// The Temporal Web UI runs on port 8233. In GitHub Codespaces each forwarded
+// port gets its own address, so swap the port in this page's address.
+const TEMPORAL_UI = location.hostname.endsWith(".app.github.dev")
+  ? `${location.protocol}//${location.hostname.replace(/-3000\./, "-8233.")}`
+  : "http://localhost:8233";
+
 function renderOpening(view) {
-  const temporalLink = `http://localhost:8233/namespaces/default/workflows/${encodeURIComponent(view.id)}`;
+  const temporalLink = `${TEMPORAL_UI}/namespaces/default/workflows/${encodeURIComponent(view.id)}`;
   if (!view.status) {
     const text = view.running
       ? "Paused: the worker is offline. Temporal is holding this opening and it will carry on as soon as the worker is back."

@@ -28,6 +28,14 @@ Stop with `Ctrl+C`. If Temporal was started with Docker, `npm run stop` shuts
 the container down. `npm run dev` does the same as `npm start` without
 reinstalling.
 
+**GitHub Codespaces:** create a codespace on `main` and run `npm start`. Open
+port 3000 from the **Ports** tab for the app and port 8233 for the Temporal Web
+UI. The board's "View in Temporal" links follow the forwarded address.
+
+If npm warns that some packages' install scripts are "not yet covered by
+allowScripts", you can ignore it. The app doesn't rely on those scripts:
+Workflow code is compiled with the TypeScript compiler, not swc's native binary.
+
 ## Try it in five minutes
 
 The demo clock runs fast: **1 minute = 2 seconds**. The 15-minute hold Lena

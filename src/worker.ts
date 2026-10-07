@@ -1,16 +1,20 @@
 import { NativeConnection, Worker } from "@temporalio/worker";
+import * as activities from "./activities";
+import { ensureSeeded } from "./store";
 
 async function run(): Promise<void> {
+  ensureSeeded();
   const connection = await NativeConnection.connect({
     address: process.env.TEMPORAL_ADDRESS ?? "localhost:7233",
   });
   const worker = await Worker.create({
     connection,
     namespace: "default",
-    taskQueue: "assessment-starter",
+    taskQueue: "juniper-waitlist",
     workflowsPath: require.resolve("./workflows"),
+    activities,
   });
-  console.log("Worker is polling the assessment-starter task queue.");
+  console.log("Worker is polling the juniper-waitlist task queue.");
   await worker.run();
 }
 

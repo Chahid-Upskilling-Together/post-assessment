@@ -5,7 +5,7 @@
 // Writes deck.html and juniper-salon-slides.pdf next to this script: five
 // 13.333in x 7.5in slides rendered with Playwright Chromium.
 //
-// Screenshots are optional. Put img/staff-board.png (wide desktop shot) and
+// Screenshots are optional. Put img/staff-board.png (one wide opening card) and
 // img/client-phone.png (tall phone shot) next to this script and rebuild; each
 // is embedded as a data URI. Until a file exists, a dashed placeholder box is
 // drawn in its place, so the deck always builds.
@@ -46,12 +46,42 @@ function dataUri(rel) {
   return `data:${mime};base64,${readFileSync(file).toString('base64')}`;
 }
 
+// Pixel size from a PNG header (null for anything else).
+function pngSize(file) {
+  const b = readFileSync(file);
+  return b.length > 24 && b.readUInt32BE(0) === 0x89504e47 ? { w: b.readUInt32BE(16), h: b.readUInt32BE(20) } : null;
+}
+
+const placeholder = (rel, label, kind, style = '') =>
+  `<div class="shot ${kind} placeholder"${style}><div><strong>${label}</strong><span class="ph-path">${rel}</span></div></div>`;
+
 // A fixed-size box. The image is scaled to fit inside it (object-fit: contain),
-// so a wide desktop shot or a tall phone shot never overflows the slide.
+// so whatever its shape, it never overflows the slide.
 function shot(rel, label, kind) {
   const src = dataUri(rel);
   if (src) return `<div class="shot ${kind}"><img src="${src}" alt="${label}"></div>`;
-  return `<div class="shot ${kind} placeholder"><div><strong>${label}</strong><span class="ph-path">${rel}</span></div></div>`;
+  return placeholder(rel, label, kind);
+}
+
+// The staff-board card is very wide, so its box is sized to the image itself:
+// a fixed width, and a height that follows the image's shape (only its top
+// BOARD_KEEP_TOP pixel rows, when set). If that would be taller than maxHeight,
+// it falls back to a maxHeight box with object-fit: contain.
+const FRAME = 6; // .shot padding + border, per side
+const BOARD_KEEP_TOP = 432; // hides the card's footer row (an internal ID and a link to the developer
+                            // dashboard), which means nothing to Lena; 0 shows the whole image
+function wideShot(rel, label, kind, width, maxHeight, keepTop = 0) {
+  const src = dataUri(rel);
+  const size = src && pngSize(join(HERE, rel));
+  let height = maxHeight, crop = false;
+  if (size) {
+    const rows = keepTop > 0 && keepTop < size.h ? keepTop : size.h;
+    const fitted = Math.round((width - 2 * FRAME) * rows / size.w) + 2 * FRAME;
+    if (fitted <= maxHeight) { height = fitted; crop = rows < size.h; }
+  }
+  const style = ` style="width:${width}px;height:${height}px"`;
+  if (!src) return placeholder(rel, label, kind, style);
+  return `<div class="shot ${kind}${crop ? ' top' : ''}"${style}><img src="${src}" alt="${label}"></div>`;
 }
 
 // ---------------------------------------------------------------- slides ---
@@ -95,31 +125,28 @@ const slides = [
   <h2>Add the opening once. It works the waitlist for you.</h2>
   <p class="sub">It follows the rule you chose: “one at a time in waitlist order feels fairer and avoids competing acceptances.”</p>
 
-  <div class="cols">
-    <ol class="steps">
-      <li><span class="n">1</span><div><h4>Add the opening</h4>
-        <p>You or Carla enter the service, stylist, date and time. It takes a few seconds, and Square stays
-        your real calendar.</p></div></li>
-      <li><span class="n">2</span><div><h4>It finds who fits</h4>
-        <p>Clients who want that service, are free at that time, and either don’t mind which stylist or asked
-        for this one. Whoever joined the waitlist first goes first. Anyone who opted out of texts is never
-        contacted.</p></div></li>
-      <li><span class="n">3</span><div><h4>One client gets a text</h4>
-        <p>It shows the service, stylist, date and time, and asks them to <span class="chip">Reply YES or NO</span>.
-        Only one client holds the offer at a time.</p></div></li>
-      <li><span class="n">4</span><div><h4>It waits, then moves on by itself</h4>
-        <p>A same-day offer is held for 15 minutes (60 minutes for later dates). After a NO, or no reply in
-        time, the next client gets the text.</p></div></li>
-      <li><span class="n">5</span><div><h4>Booked, and everyone is told</h4>
-        <p>On a YES, the client gets a confirmation, the front desk gets a note to add it to Square, and anyone
-        whose time ran out hears that it has been filled.</p></div></li>
-    </ol>
-    <figure class="fig-board">
-      ${shot('img/staff-board.png', 'Staff board screenshot', 'board')}
-      <figcaption>The staff board, at a glance: who has the offer and how long they have left, who declined,
-      timed out or couldn’t be reached, who’s next, and whether the opening is filled, cancelled or
-      unfilled.</figcaption>
-    </figure>
+  <ol class="flow">
+    <li><div class="top"><span class="n">1</span><h4>Add the opening</h4></div>
+      <p>You or Carla enter the service, stylist, date and time. It takes a few seconds, and Square stays your
+      real calendar.</p></li>
+    <li><div class="top"><span class="n">2</span><h4>Find who fits</h4></div>
+      <p>Clients who want that service, are free then and are happy with that stylist, in waitlist order.
+      Anyone who opted out is never texted.</p></li>
+    <li><div class="top"><span class="n">3</span><h4>Text one client</h4></div>
+      <p>The text shows the service, stylist, date and time and asks them to <span class="chip">Reply YES or NO</span>.
+      Only one client holds the offer at a time.</p></li>
+    <li><div class="top"><span class="n">4</span><h4>Wait for a reply</h4></div>
+      <p>A same-day offer is held 15 minutes (60 for later dates), and a hold never runs past the appointment
+      time. A NO or no reply moves it to the next client.</p></li>
+    <li><div class="top"><span class="n">5</span><h4>A YES books it</h4></div>
+      <p>The client gets a confirmation, the front desk gets a note to add it to Square, and anyone whose time
+      ran out hears it’s been filled.</p></li>
+  </ol>
+
+  <div class="boardrow">
+    ${wideShot('img/staff-board.png', 'Staff board screenshot', 'board', 820, 300, BOARD_KEEP_TOP)}
+    <p class="boardcap">One opening on the staff board: who has the offer and how long they have left, who
+    couldn’t be reached and why, and what happens next.</p>
   </div>
 `,
 
@@ -127,25 +154,31 @@ const slides = [
 `
   <div class="kicker">When something goes wrong</div>
   <h2>Built so nothing slips through the cracks.</h2>
-  <p class="sub">Every problem is either handled automatically or shown to staff right away. Temporal, the system
+  <p class="sub">Problems are handled automatically or flagged to staff right away. Temporal, the system
   underneath, makes sure no opening gets lost or forgotten along the way.</p>
 
-  <div class="cols">
+  <div class="cols cases-row">
     <div class="tablewrap">
       <table class="cases">
+        <colgroup><col style="width:20%"><col style="width:55%"><col style="width:25%"></colgroup>
         <thead><tr><th>If this happens</th><th>What the prototype does</th><th>What you told us</th></tr></thead>
         <tbody>
           <tr><td class="if">Two clients want the same opening</td>
-              <td>Only one client holds the offer at a time, so two people can never both be booked into it.</td>
+              <td>Only one client holds the offer at a time, and each stylist’s time slot can only be offered once
+              at a time, even if it’s entered twice, so two people can never both be booked into it.</td>
               <td class="said">“two clients expected the same Saturday haircut”</td></tr>
-          <tr><td class="if">A YES arrives after their time ran out</td>
+          <tr><td class="if">A client opts out or is booked</td>
+              <td>The waitlist is re-checked before every text, so anyone who opted out or was booked into another
+              opening in the meantime is skipped.</td>
+              <td class="said">“Some clients may opt out of texts”</td></tr>
+          <tr><td class="if">A YES comes in too late</td>
               <td>They get a polite text saying it’s no longer available and they’re still on the waitlist.</td>
               <td class="said">“We have to tell them it’s gone, which is awkward.”</td></tr>
           <tr><td class="if">A text doesn’t go through</td>
               <td>It’s retried automatically. If it still fails, that client is skipped and staff are told to
               check the number.</td>
               <td class="said">“a message not reaching someone”</td></tr>
-          <tr><td class="if">A reply is unclear, like <em>maybe later?</em></td>
+          <tr><td class="if">An unclear reply, like <em>maybe later?</em></td>
               <td>The client is asked to answer YES or NO, and staff see a flag with one-click
               <span class="btn">Mark yes</span> and <span class="btn">Mark no</span> buttons.</td>
               <td class="said">“Replies can also be unclear”</td></tr>
@@ -163,7 +196,7 @@ const slides = [
     </div>
     <figure class="fig-phone">
       ${shot('img/client-phone.png', 'Client phone screenshot', 'phone')}
-      <figcaption>A client’s phone: the offer, then a clear answer either way.</figcaption>
+      <figcaption>A simulated client phone: the offer, an unclear reply, and a polite request to answer YES or NO.</figcaption>
     </figure>
   </div>
 `,
@@ -195,7 +228,7 @@ const slides = [
         <li><strong>The waitlist</strong> is sample data with made-up names and 555 numbers, not your Google Sheet.</li>
         <li><strong>Square</strong> isn’t connected, as you chose: “We don’t need this to update Square; staff handle
         the real calendar.”</li>
-        <li><strong>The clock</strong> runs fast for demos: 1 minute = 1 second, so a 15-minute hold lasts 15 seconds.</li>
+        <li><strong>The clock</strong> runs fast for demos: 1 minute = 2 seconds, so a 15-minute hold lasts 30 seconds.</li>
         <li><strong>Not built yet:</strong> staff logins, running on more than one computer, a quiet-hours rule
         (you have “no formal rule” yet), and clients joining the waitlist from the app.</li>
       </ul>
@@ -213,11 +246,11 @@ const slides = [
   <div class="cols three">
     <div class="panel">
       <h3>The pilot</h3>
-      <ol class="nums">
-        <li>Connect a real texting service to the salon’s phone number.</li>
-        <li>Import your Google Sheet waitlist.</li>
-        <li>Use it for every cancellation inside 48 hours.</li>
-        <li>Carla watches the board instead of the phone.</li>
+      <ol class="timeline">
+        <li><b>Week 0</b><span>Set up real texting on the salon’s number and import your Google Sheet waitlist.</span></li>
+        <li><b>Weeks 1–2</b><span>Live on every cancellation inside 48 hours, with Carla watching the board
+        instead of the phone.</span></li>
+        <li><b>End of week 2</b><span>Review the numbers together.</span></li>
       </ol>
     </div>
     <div class="panel warm">
@@ -234,7 +267,7 @@ const slides = [
     <div class="panel">
       <h3>How we’ll measure it</h3>
       <div class="measure"><b>Openings filled</b><span>out of your 8–12 short-notice cancellations a week</span></div>
-      <div class="measure"><b>Time spent chasing replies</b><span>compared with today</span></div>
+      <div class="measure"><b>Time spent chasing replies</b><span>timed for one normal week before the pilot, then during it</span></div>
       <div class="measure"><b>Double bookings</b><span>target: zero</span></div>
     </div>
   </div>
@@ -290,6 +323,7 @@ const css = `
   .sub { font-size: 14pt; line-height: 1.42; color: var(--muted); margin-top: 10px; max-width: 72em; }
 
   .cols { display: flex; gap: 0.38in; margin-top: 0.26in; min-height: 0; }
+  .cols.cases-row { gap: 0.3in; margin-top: 0.18in; }
 
   /* cards */
   .card { background: var(--paper); border: 1px solid var(--line); border-radius: 14px;
@@ -308,31 +342,33 @@ const css = `
   .banner .lbl { font-size: 11.5pt; font-weight: 600; line-height: 1.3; opacity: .92; }
   .banner p { font-size: 14pt; line-height: 1.45; }
 
-  /* slide 2: steps + board */
-  ol.steps { list-style: none; flex: 1; display: flex; flex-direction: column; gap: 0.12in; }
-  ol.steps li { display: flex; gap: 14px; align-items: flex-start; position: relative; }
-  ol.steps li:not(:last-child)::after { content: ''; position: absolute; left: 14px; top: 34px;
-                                        bottom: calc(-0.12in + 3px); width: 2px; background: var(--sage-line); }
-  ol.steps .n { flex: none; width: 30px; height: 30px; border-radius: 50%; background: var(--sage-deep);
-                color: #fff; font-weight: 800; font-size: 12pt; display: flex; align-items: center;
-                justify-content: center; }
-  ol.steps h4 { font-size: 13pt; font-weight: 800; margin: 4px 0 2px; }
-  ol.steps p { font-size: 11.5pt; line-height: 1.42; color: var(--muted); }
+  /* slide 2: step strip + board */
+  ol.flow { list-style: none; display: grid; grid-template-columns: repeat(5, 1fr); gap: 12px; margin-top: 0.2in; }
+  ol.flow li { background: var(--paper); border: 1px solid var(--line); border-radius: 12px; padding: 11px 13px 12px;
+               box-shadow: 0 1px 8px rgba(38,53,46,.05); }
+  ol.flow .top { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+  ol.flow .n { flex: none; width: 24px; height: 24px; border-radius: 50%; background: var(--sage-deep); color: #fff;
+               font-weight: 800; font-size: 11pt; display: flex; align-items: center; justify-content: center; }
+  ol.flow h4 { font-size: 12pt; font-weight: 800; line-height: 1.2; }
+  ol.flow p { font-size: 11pt; line-height: 1.38; color: var(--muted); }
+  .boardrow { display: flex; align-items: center; gap: 0.3in; margin-top: 0.2in; }
+  .boardcap { font-size: 12.5pt; line-height: 1.45; color: var(--muted); border-left: 4px solid var(--sage);
+              padding-left: 14px; }
   .chip { display: inline-block; white-space: nowrap; background: var(--sage-soft); color: var(--sage-deep);
           border: 1px solid var(--sage-line); border-radius: 999px; padding: 0 8px; font-size: 11pt;
           font-weight: 700; line-height: 1.45; }
 
   figure { flex: none; display: flex; flex-direction: column; }
   figcaption { font-size: 11pt; line-height: 1.4; color: var(--muted); margin-top: 10px; }
-  .fig-board { width: 5.2in; }
-  .fig-phone { width: 1.9in; }
+  .fig-phone { width: 1.8in; }
 
-  /* Fixed boxes sized to the expected screenshots: ~1440x1000 desktop, ~400x800 phone. */
+  /* Phone: a fixed box (contain). Board: sized from the image itself, see wideShot(). */
   .shot { position: relative; background: var(--paper); border: 1px solid var(--line); border-radius: 14px;
           box-shadow: 0 8px 22px rgba(38,53,46,.10); overflow: hidden; padding: 5px; }
   .shot img { display: block; width: 100%; height: 100%; object-fit: contain; border-radius: 9px; }
-  .shot.board { width: 5.2in; height: 3.62in; }
-  .shot.phone { width: 1.9in; height: 3.8in; border-radius: 18px; }
+  .shot.board { flex: none; }
+  .shot.top img { object-fit: cover; object-position: top center; }
+  .shot.phone { width: 1.8in; height: 3.2in; border-radius: 18px; }
   .shot.phone.placeholder { padding: 8px; }
   .shot.placeholder { background: rgba(255,255,255,.45); border: 2px dashed var(--sage-line); box-shadow: none;
                       display: flex; align-items: center; justify-content: center; text-align: center; padding: 14px; }
@@ -343,13 +379,13 @@ const css = `
   /* slide 3: cases table */
   .tablewrap { flex: 1; align-self: flex-start; background: var(--paper); border: 1px solid var(--line);
                border-radius: 14px; overflow: hidden; box-shadow: 0 1px 10px rgba(38,53,46,.05); }
-  table.cases { width: 100%; border-collapse: collapse; }
+  table.cases { width: 100%; border-collapse: collapse; table-layout: fixed; }
   .cases th { text-align: left; font-size: 11pt; font-weight: 800; letter-spacing: .03em; color: var(--sage-deep);
-              background: var(--sage-soft); padding: 8px 14px; }
-  .cases td { font-size: 11pt; line-height: 1.36; color: var(--muted); padding: 7px 14px;
+              background: var(--sage-soft); padding: 5px 12px; }
+  .cases td { font-size: 11pt; line-height: 1.3; color: var(--muted); padding: 4px 12px;
               border-top: 1px solid var(--line); vertical-align: top; }
-  .cases td.if { width: 24%; font-weight: 700; color: var(--ink); }
-  .cases td.said { width: 27%; font-style: italic; color: var(--clay); }
+  .cases td.if { font-weight: 700; color: var(--ink); }
+  .cases td.said { font-style: italic; color: var(--clay); }
   .btn { display: inline-block; white-space: nowrap; border: 1px solid var(--sage-line); background: var(--sage-soft);
          color: var(--sage-deep); border-radius: 6px; padding: 0 6px; font-size: 11pt; font-weight: 700; line-height: 1.4; }
 
@@ -373,13 +409,15 @@ const css = `
   .cols.three { display: grid; grid-template-columns: 1.05fr 1fr 1fr; gap: 0.26in; margin-top: 0.28in; }
   .cols.three > .panel { padding: 20px 26px; }
   .cols.three h3 { font-size: 16pt; margin-bottom: 16px; }
-  ol.nums { list-style: none; counter-reset: n; }
-  ol.nums li { counter-increment: n; position: relative; padding-left: 40px; font-size: 13pt; line-height: 1.42;
-               min-height: 28px; }
-  ol.nums li + li { margin-top: 15px; }
-  ol.nums li::before { content: counter(n); position: absolute; left: 0; top: -1px; width: 27px; height: 27px;
-                       border-radius: 50%; background: var(--sage-soft); color: var(--sage-deep); font-weight: 800;
-                       font-size: 11pt; line-height: 27px; text-align: center; }
+  ol.timeline { list-style: none; }
+  ol.timeline li { position: relative; padding-left: 26px; display: flex; flex-direction: column; gap: 2px; }
+  ol.timeline li + li { margin-top: 14px; }
+  ol.timeline li::before { content: ''; position: absolute; left: 0; top: 5px; width: 12px; height: 12px;
+                           border-radius: 50%; background: var(--sage-deep); }
+  ol.timeline li:not(:last-child)::after { content: ''; position: absolute; left: 5px; top: 21px; bottom: -12px;
+                                           width: 2px; background: var(--sage-line); }
+  ol.timeline b { font-size: 12pt; font-weight: 800; color: var(--sage-deep); letter-spacing: .02em; }
+  ol.timeline span { font-size: 12.5pt; line-height: 1.4; color: var(--muted); }
   .panel.warm { background: var(--clay-soft); border-color: var(--clay-line); }
   .decision + .decision { margin-top: 16px; padding-top: 16px; border-top: 1px solid var(--clay-line); }
   .decision h4 { font-size: 13.5pt; font-weight: 800; margin-bottom: 5px; }

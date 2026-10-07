@@ -179,7 +179,7 @@ const slides = [
               check the number.</td>
               <td class="said">“a message not reaching someone”</td></tr>
           <tr><td class="if">An unclear reply, like <em>maybe later?</em></td>
-              <td>The client is asked to answer YES or NO, and staff see a flag with one-click
+              <td>The client is asked to answer YES or NO, and staff see a flag with <span class="nowrap">one-click</span>
               <span class="btn">Mark yes</span> and <span class="btn">Mark no</span> buttons.</td>
               <td class="said">“Replies can also be unclear”</td></tr>
           <tr><td class="if">Nobody takes the opening</td>
@@ -386,6 +386,7 @@ const css = `
               border-top: 1px solid var(--line); vertical-align: top; }
   .cases td.if { font-weight: 700; color: var(--ink); }
   .cases td.said { font-style: italic; color: var(--clay); }
+  .nowrap { white-space: nowrap; }
   .btn { display: inline-block; white-space: nowrap; border: 1px solid var(--sage-line); background: var(--sage-soft);
          color: var(--sage-deep); border-radius: 6px; padding: 0 6px; font-size: 11pt; font-weight: 700; line-height: 1.4; }
 

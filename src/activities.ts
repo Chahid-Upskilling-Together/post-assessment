@@ -2,7 +2,7 @@
 // salon phone, the front desk). Temporal retries them when they fail.
 import { ApplicationFailure, Context } from "@temporalio/activity";
 import * as store from "./store";
-import type { FrontDeskNote, MatchResult, Opening, Weekday } from "./types";
+import type { FrontDeskNote, MatchResult, OfferCheck, Opening, Weekday } from "./types";
 
 const WEEKDAYS: Weekday[] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 
@@ -24,6 +24,17 @@ export async function findMatchingClients(opening: Opening): Promise<MatchResult
     candidates: inOrder.map(({ id, name, mobile }) => ({ id, name, mobile })),
     skippedOptedOut: fits.filter((c) => c.optedOut).map((c) => c.name),
   };
+}
+
+// Checked right before each offer, because the waitlist can change while an
+// opening runs: the client may have opted out, been booked by another opening,
+// or be holding another opening's offer right now.
+export async function startOffer(clientId: string, openingId: string): Promise<OfferCheck> {
+  return store.claimOffer(clientId, openingId);
+}
+
+export async function endOffer(clientId: string, openingId: string): Promise<void> {
+  store.releaseOffer(clientId, openingId);
 }
 
 // Simulated text message. Delivery can fail; Temporal retries it.

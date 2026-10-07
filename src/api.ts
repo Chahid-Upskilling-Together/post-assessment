@@ -1,6 +1,5 @@
-import { randomUUID } from "node:crypto";
 import path from "node:path";
-import { Client, Connection } from "@temporalio/client";
+import { Client, Connection, WorkflowExecutionAlreadyStartedError } from "@temporalio/client";
 import express, { type NextFunction, type Request, type Response } from "express";
 import { SERVICES, STYLISTS } from "./seed";
 import * as store from "./store";
@@ -10,11 +9,11 @@ import { cancelOpening, clientReply, fillOpeningWorkflow, getOpeningStatus, pars
 const TASK_QUEUE = "juniper-waitlist";
 
 // Lena's rule: 15 minutes for a same-day opening, longer otherwise (60 is our
-// assumption). MINUTE_MS=1000 runs the demo clock at one minute per second.
+// assumption). MINUTE_MS=2000 runs the demo clock at one minute per 2 seconds.
 const policy: Policy = {
   sameDayHoldMinutes: Number(process.env.SAME_DAY_HOLD_MINUTES ?? 15),
   laterHoldMinutes: Number(process.env.LATER_HOLD_MINUTES ?? 60),
-  minuteMs: Number(process.env.MINUTE_MS ?? 1000),
+  minuteMs: Number(process.env.MINUTE_MS ?? 2000),
 };
 
 store.ensureSeeded();
@@ -32,6 +31,16 @@ function getClient(): Promise<Client> {
 
 const pad = (n: number) => String(n).padStart(2, "0");
 const localDate = (d = new Date()) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+
+// Pre-fill the form with the next slot the sample waitlist can take: the next
+// hour today (10:00 to 17:00), otherwise tomorrow at 2:00 pm.
+function defaultSlot(now = new Date()): { date: string; time: string } {
+  const hour = Math.max(10, now.getHours() + 1);
+  if (hour <= 17) return { date: localDate(now), time: `${pad(hour)}:00` };
+  const tomorrow = new Date(now);
+  tomorrow.setDate(now.getDate() + 1);
+  return { date: localDate(tomorrow), time: "14:00" };
+}
 
 function describeWhen(date: string, time: string, sameDay: boolean): string {
   const [h, m] = time.split(":").map(Number);
@@ -78,7 +87,8 @@ async function viewOpening(client: Client, id: string): Promise<OpeningView> {
 }
 
 app.get("/api/config", (_request, response) => {
-  response.json({ services: SERVICES, stylists: STYLISTS, policy, today: localDate() });
+  const slot = defaultSlot();
+  response.json({ services: SERVICES, stylists: STYLISTS, policy, today: localDate(), defaultDate: slot.date, defaultTime: slot.time });
 });
 
 app.get("/api/state", async (_request, response) => {
@@ -102,15 +112,31 @@ app.post("/api/openings", async (request, response) => {
     response.status(400).json({ error: "Choose a service, stylist, date and time." });
     return;
   }
+  const startsAt = new Date(`${date}T${time}:00`).getTime(); // the salon's local time
+  if (startsAt <= Date.now()) {
+    response.status(400).json({ error: "That time has already passed. Choose a later time." });
+    return;
+  }
   const sameDay = date === localDate();
-  const id = `opening-${date}-${time.replace(":", "")}-${stylist.toLowerCase()}-${service.toLowerCase()}-${randomUUID().slice(0, 4)}`;
-  const opening: Opening = { id, service, stylist, date, time, sameDay, when: describeWhen(date, time, sameDay) };
+  // One Workflow per stylist and time: Temporal refuses a second run with the
+  // same ID while the first is still going, so a slot can't be offered twice
+  // (a double click, or Lena and Carla both entering the same cancellation).
+  const id = `opening-${date}-${time.replace(":", "")}-${stylist.toLowerCase()}`;
+  const opening: Opening = { id, service, stylist, date, time, sameDay, startsAt, when: describeWhen(date, time, sameDay) };
   const client = await getClient();
-  await client.workflow.start(fillOpeningWorkflow, {
-    workflowId: id,
-    taskQueue: TASK_QUEUE,
-    args: [{ opening, policy }],
-  });
+  try {
+    await client.workflow.start(fillOpeningWorkflow, {
+      workflowId: id,
+      taskQueue: TASK_QUEUE,
+      args: [{ opening, policy }],
+    });
+  } catch (error) {
+    if (error instanceof WorkflowExecutionAlreadyStartedError) {
+      response.status(409).json({ error: `This slot (${stylist}, ${describeWhen(date, time, sameDay)}) is already being offered. See it below.`, id });
+      return;
+    }
+    throw error;
+  }
   store.addOpeningId(id);
   response.status(201).json({ id });
 });
@@ -155,14 +181,21 @@ app.post("/api/replies", async (request, response) => {
     answer("Thanks! There's no opening on offer for you right now. We'll text you when one comes up.", "no_offer");
     return;
   }
+  const client = await getClient();
+  const handle = client.workflow.getHandle(offer.openingId);
   try {
-    const client = await getClient();
-    const result = await client.workflow
-      .getHandle(offer.openingId)
-      .executeUpdate(clientReply, { args: [{ clientId, text, by: "client" }] });
+    const result = await handle.executeUpdate(clientReply, { args: [{ clientId, text, by: "client" }] });
     response.json(result);
   } catch {
-    // That opening's process has already finished (filled, cancelled or unfilled).
+    // Either that opening has finished (filled, cancelled or unfilled), or this
+    // client wasn't offered it. If Temporal itself can't be reached, say so
+    // rather than telling the client something that may not be true.
+    try {
+      await client.connection.withDeadline(Date.now() + 3000, () => handle.describe());
+    } catch {
+      response.status(503).json({ error: "Temporal can't be reached right now, so the reply wasn't processed. Try again in a moment." });
+      return;
+    }
     if (parseReply(text) === "stop") {
       store.updateClient(clientId, { optedOut: true });
       answer("You won't get any more opening texts from Juniper Salon. Call us any time if you change your mind.", "opted_out", offer.openingId);

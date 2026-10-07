@@ -6,6 +6,10 @@ let state;
 let selectedClient;
 let lastRenderedThread = "";
 let lastMessageCount = 0;
+// The board redraws every second; remember what staff opened or picked.
+const openHistories = new Set();
+const cancelReasons = new Map();
+const CANCEL_REASONS = ["client changed their mind", "stylist unavailable", "filled another way"];
 
 const PHASE = {
   finding: ["Finding matches", "finding"],
@@ -23,6 +27,7 @@ const CANDIDATE = {
   unreachable: "Couldn't reach",
   opted_out: "Opted out",
   withdrawn: "Told it's cancelled",
+  skipped: "Skipped",
   booked: "Booked",
 };
 
@@ -47,7 +52,10 @@ async function api(path, body) {
 function renderOpening(view) {
   const temporalLink = `http://localhost:8233/namespaces/default/workflows/${encodeURIComponent(view.id)}`;
   if (!view.status) {
-    return `<article class="card opening"><p class="headline">${view.running ? "Waiting for the Worker to start this opening…" : esc(view.error ?? "Unavailable")}</p>
+    const text = view.running
+      ? "Paused: the worker is offline. Temporal is holding this opening and it will carry on as soon as the worker is back."
+      : esc(view.error ?? "Unavailable");
+    return `<article class="card opening tone-paused"><p class="headline">${text}</p>
       <footer><span class="wfid">Workflow ID: ${esc(view.id)}</span><a href="${temporalLink}" target="_blank">View in Temporal</a></footer></article>`;
   }
   const s = view.status;
@@ -62,17 +70,20 @@ function renderOpening(view) {
   else if (s.phase === "offering") headline = current
     ? `Waiting for <b>${esc(current.name)}</b> to reply · ${minutesLeft(current)}`
     : "Moving to the next person…";
-  else if (s.phase === "filled") headline = `Filled by <b>${esc(booked?.name)}</b>. Client and front desk have been told.`;
+  else if (s.phase === "filled") headline = s.wrappedUp
+    ? `Filled by <b>${esc(booked?.name)}</b>. Client and front desk have been told.`
+    : `Filled by <b>${esc(booked?.name)}</b>. Sending the confirmation…`;
   else if (s.phase === "cancelled") headline = `Cancelled (${esc(s.cancelReason)}). Anyone holding the offer was told.`;
+  else if (s.endReason) headline = "Unfilled: the appointment time arrived before anyone said yes. The front desk has been told.";
   else headline = s.candidates.length
-    ? "Unfilled: everyone who fits has passed. The front desk has been told."
+    ? "Unfilled: nobody who fits took it. The front desk has been told."
     : "Unfilled: nobody on the waitlist fits this opening. The front desk has been told.";
 
   const line = s.candidates.length
     ? `<ol class="line">${s.candidates.map((c) => `
         <li class="cand st-${c.state}">
           <span class="name">${esc(c.name)}</span>
-          <span class="chip">${CANDIDATE[c.state]}${c.state === "offered" && s.phase === "offering" ? ` · ${minutesLeft(c)}` : ""}</span>
+          <span class="chip">${CANDIDATE[c.state]}${c.state === "offered" && s.phase === "offering" ? ` · ${minutesLeft(c)}` : ""}${c.state === "skipped" && c.note ? `: ${esc(c.note)}` : ""}</span>
         </li>`).join("")}</ol>`
     : "";
   const skipped = s.skippedOptedOut.length
@@ -88,9 +99,7 @@ function renderOpening(view) {
   const cancel = canCancel ? `
     <span class="cancel">
       <select data-reason="${esc(view.id)}">
-        <option>client changed their mind</option>
-        <option>stylist unavailable</option>
-        <option>filled another way</option>
+        ${CANCEL_REASONS.map((r) => `<option ${cancelReasons.get(view.id) === r ? "selected" : ""}>${r}</option>`).join("")}
       </select>
       <button class="danger" data-cancel="${esc(view.id)}">Cancel opening</button>
     </span>` : "";
@@ -110,7 +119,7 @@ function renderOpening(view) {
       ${attention}
       ${line}
       ${skipped}
-      <details><summary>What happened</summary><ul class="history">${history}</ul></details>
+      <details data-history="${esc(view.id)}" ${openHistories.has(view.id) ? "open" : ""}><summary>What happened</summary><ul class="history">${history}</ul></details>
       <footer>
         <span class="wfid">Workflow ID: ${esc(view.id)}</span>
         <a href="${temporalLink}" target="_blank">View in Temporal</a>
@@ -167,9 +176,12 @@ function renderPhones() {
 
 function render() {
   $("#flaky").checked = state.settings.flakyTexts;
-  $("#openings").innerHTML = state.openings.length
-    ? state.openings.map(renderOpening).join("")
-    : '<section class="card empty-state"><h2>No openings yet</h2><p>When a client cancels in Square, add the slot above. The waitlist is offered it one person at a time.</p></section>';
+  // Don't redraw while staff have a menu on the board open.
+  if (!document.activeElement?.closest?.("#openings select")) {
+    $("#openings").innerHTML = state.openings.length
+      ? state.openings.map(renderOpening).join("")
+      : '<section class="card empty-state"><h2>No openings yet</h2><p>When a client cancels in Square, add the slot above. The waitlist is offered it one person at a time.</p></section>';
+  }
   renderWaitlist();
   renderFrontDesk();
   renderPhones();
@@ -189,11 +201,15 @@ async function init() {
   const form = $("#new-opening");
   form.service.innerHTML = config.services.map((s) => `<option>${esc(s)}</option>`).join("");
   form.stylist.innerHTML = config.stylists.map((s) => `<option>${esc(s)}</option>`).join("");
-  form.date.value = config.today;
-  form.time.value = "14:00";
+  form.date.value = config.defaultDate;
+  form.date.min = config.today;
+  form.time.value = config.defaultTime;
   const p = config.policy;
+  const seconds = (minutes) => (minutes * p.minuteMs) / 1000;
   $("#rules").textContent = `Offered only to clients with the same service, free at that time, and the stylist they insist on. Opted-out clients are never texted. Each person gets ${p.sameDayHoldMinutes} min (same day) or ${p.laterHoldMinutes} min (later days).`;
-  $("#clock-pill").textContent = p.minuteMs === 60000 ? "Real-time clock" : `Demo clock: 1 minute = ${p.minuteMs / 1000} second${p.minuteMs === 1000 ? "" : "s"}`;
+  $("#clock-pill").textContent = p.minuteMs === 60000
+    ? "Real-time clock"
+    : `Demo clock: 1 minute = ${p.minuteMs / 1000} second${p.minuteMs === 1000 ? "" : "s"} (a ${p.sameDayHoldMinutes}-minute hold lasts ${seconds(p.sameDayHoldMinutes)} s)`;
   await refresh();
   setInterval(refresh, 1000);
 }
@@ -201,14 +217,29 @@ async function init() {
 $("#new-opening").addEventListener("submit", async (event) => {
   event.preventDefault();
   const form = event.target;
+  const button = form.querySelector('button[type="submit"]');
   $("#form-error").hidden = true;
+  button.disabled = true;
   try {
     await api("/api/openings", { service: form.service.value, stylist: form.stylist.value, date: form.date.value, time: form.time.value });
     await refresh();
   } catch (error) {
     $("#form-error").textContent = error.message;
     $("#form-error").hidden = false;
+  } finally {
+    button.disabled = false;
   }
+});
+
+document.addEventListener("toggle", (event) => {
+  const details = event.target;
+  if (!details.matches?.("details[data-history]")) return;
+  if (details.open) openHistories.add(details.dataset.history);
+  else openHistories.delete(details.dataset.history);
+}, true);
+
+document.addEventListener("change", (event) => {
+  if (event.target.matches("select[data-reason]")) cancelReasons.set(event.target.dataset.reason, event.target.value);
 });
 
 document.addEventListener("click", async (event) => {

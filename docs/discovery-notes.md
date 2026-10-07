@@ -80,3 +80,6 @@ quote.
 | What happens if a text cannot be delivered | Retried automatically, then that client is skipped and staff are told | Matches "a message not reaching someone" plus "we need to know" |
 | Quiet hours | Not enforced; listed as a next step | She has "no formal rule" yet |
 | A reply after someone's turn has passed | Polite "no longer available" text; they stay on the waitlist | No competing claims, and it removes the awkward manual reply |
+| Cutoff | No offers once the appointment has started, and a hold never runs past it | "No strict cutoff", but an offer for a slot that has already started can't be taken |
+| Two openings at once | A client holds one live offer at a time. The list is re-checked before every text, so anyone who opted out or was booked meanwhile is skipped | A "YES" must mean one thing, and opt-outs must be respected everywhere |
+| The same slot entered twice | Refused: one offer process per stylist and time | Her double-booking story started with two staff answering separately |

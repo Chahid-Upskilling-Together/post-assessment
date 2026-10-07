@@ -27,7 +27,8 @@ const works = (command, args) => spawnSync(command, args, { stdio: "ignore" }).s
 // Each service runs in its own process group so shutting down stops all of it
 // (npm, the shell it starts, and the Node process underneath).
 const isWindows = process.platform === "win32";
-const startService = (command, args) => spawn(command, args, { stdio: "inherit", detached: !isWindows });
+// On Windows, npm is a .cmd script and needs a shell to start.
+const startService = (command, args) => spawn(command, args, { stdio: "inherit", detached: !isWindows, shell: isWindows });
 function stopService(child) {
   if (!child || child.exitCode !== null) return;
   try {

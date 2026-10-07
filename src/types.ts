@@ -29,6 +29,8 @@ export type Opening = {
   time: string; // HH:MM, 24h
   when: string; // human label, e.g. "today at 2:00 pm"
   sameDay: boolean;
+  // When the appointment starts (ms since epoch). No offers go out after this.
+  startsAt?: number;
 };
 
 export type Policy = {
@@ -49,6 +51,7 @@ export type CandidateState =
   | "unreachable"
   | "opted_out"
   | "withdrawn"
+  | "skipped"
   | "booked";
 
 export type Candidate = {
@@ -58,6 +61,7 @@ export type Candidate = {
   state: CandidateState;
   offeredAt?: number;
   expiresAt?: number;
+  note?: string; // why they were skipped
 };
 
 export type OpeningPhase = "finding" | "offering" | "filled" | "unfilled" | "cancelled";
@@ -81,6 +85,9 @@ export type OpeningStatus = {
   currentClientId?: string;
   bookedClientId?: string;
   cancelReason?: string;
+  endReason?: string;
+  // True once the closing texts and front desk note have gone out.
+  wrappedUp: boolean;
   attention: Attention[];
   history: HistoryEntry[];
 };
@@ -113,3 +120,6 @@ export type FrontDeskNote = {
 };
 
 export type Settings = { flakyTexts: boolean };
+
+// Result of trying to give a client an offer: one live offer per client at a time.
+export type OfferCheck = "ok" | "opted_out" | "booked" | "busy";

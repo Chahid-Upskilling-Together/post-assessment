@@ -2,18 +2,30 @@ import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { after, before, test } from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
-import { WorkflowUpdateFailedError, type WorkflowHandle } from "@temporalio/client";
+import { WorkflowExecutionAlreadyStartedError, WorkflowUpdateFailedError, type WorkflowHandle } from "@temporalio/client";
 import { ApplicationFailure } from "@temporalio/common";
 import { TestWorkflowEnvironment } from "@temporalio/testing";
 import { bundleWorkflowCode, DefaultLogger, Runtime, Worker } from "@temporalio/worker";
 import type * as realActivities from "../src/activities";
-import type { Candidate, FrontDeskNote, MatchResult, Opening, OpeningStatus, Policy, ReplyInput, ReplyOutcome } from "../src/types";
+import type {
+  Candidate,
+  FrontDeskNote,
+  MatchResult,
+  OfferCheck,
+  Opening,
+  OpeningInput,
+  OpeningStatus,
+  Policy,
+  ReplyInput,
+  ReplyOutcome,
+} from "../src/types";
 import { cancelOpening, clientReply, fillOpeningWorkflow, getOpeningStatus, parseReply } from "../src/workflows";
 
 // ---------------------------------------------------------------------------
 // Fixtures
 
-const POLICY: Policy = { sameDayHoldMinutes: 15, laterHoldMinutes: 60, minuteMs: 60_000 };
+const MINUTE = 60_000;
+const POLICY: Policy = { sameDayHoldMinutes: 15, laterHoldMinutes: 60, minuteMs: MINUTE };
 const OPENING: Omit<Opening, "id"> = {
   service: "Haircut",
   stylist: "Ana",
@@ -33,9 +45,13 @@ const TEST_TIMEOUT = 60_000;
 // ---------------------------------------------------------------------------
 // Mocked activities that record every call
 
-type SentText = { clientId: string; kind: string; body: string };
+type SentText = { clientId: string; openingId: string; kind: string; body: string };
+type OfferCall = { clientId: string; openingId: string };
 type Calls = {
+  log: string[]; // every activity call, in order
   matched: Opening[];
+  startOffers: (OfferCall & { result: OfferCheck })[];
+  endOffers: OfferCall[];
   texts: SentText[]; // delivered
   undelivered: SentText[]; // refused by the mock
   frontDesk: Omit<FrontDeskNote, "id" | "at">[];
@@ -43,34 +59,56 @@ type Calls = {
   optOuts: string[];
 };
 type MockOptions = {
-  undeliverableTo?: string[];
-  // Keeps markBooked running for a while, so the workflow is still wrapping up
-  // (phase already "filled") when a later reply arrives.
+  // sendText throws a non-retryable "not delivered" failure when this returns true.
+  undeliverable?: (t: { clientId: string; kind: string }) => boolean;
+  // What startOffer returns for a client, call by call; "ok" once the list runs out.
+  offerChecks?: Record<string, OfferCheck[]>;
+  // Keep markBooked / notifyFrontDesk running for a while, so the workflow is
+  // still wrapping up (phase already decided) when the test looks or replies.
   markBookedDelayMs?: number;
+  frontDeskDelayMs?: number;
 };
 
 function mockActivities(opts: MockOptions) {
-  const calls: Calls = { matched: [], texts: [], undelivered: [], frontDesk: [], booked: [], optOuts: [] };
+  const calls: Calls = { log: [], matched: [], startOffers: [], endOffers: [], texts: [], undelivered: [], frontDesk: [], booked: [], optOuts: [] };
+  const checks = new Map(Object.entries(opts.offerChecks ?? {}).map(([id, list]) => [id, [...list]]));
   const activities: typeof realActivities = {
     async findMatchingClients(opening) {
+      calls.log.push("findMatchingClients");
       calls.matched.push(opening);
       return { candidates: CANDIDATES.map((c) => ({ ...c })), skippedOptedOut: [] };
     },
-    async sendText({ clientId, kind, body }) {
-      if (opts.undeliverableTo?.includes(clientId)) {
-        calls.undelivered.push({ clientId, kind, body });
+    async startOffer(clientId, openingId) {
+      const result = checks.get(clientId)?.shift() ?? "ok";
+      calls.log.push(`startOffer:${clientId}:${result}`);
+      calls.startOffers.push({ clientId, openingId, result });
+      return result;
+    },
+    async endOffer(clientId, openingId) {
+      calls.log.push(`endOffer:${clientId}`);
+      calls.endOffers.push({ clientId, openingId });
+    },
+    async sendText({ clientId, openingId, kind, body }) {
+      if (opts.undeliverable?.({ clientId, kind })) {
+        calls.log.push(`sendText:${clientId}:${kind}:undelivered`);
+        calls.undelivered.push({ clientId, openingId, kind, body });
         throw ApplicationFailure.nonRetryable("not delivered");
       }
-      calls.texts.push({ clientId, kind, body });
+      calls.log.push(`sendText:${clientId}:${kind}`);
+      calls.texts.push({ clientId, openingId, kind, body });
     },
     async notifyFrontDesk(note) {
+      calls.log.push(`notifyFrontDesk:${note.kind}`);
       calls.frontDesk.push(note);
+      if (opts.frontDeskDelayMs) await delay(opts.frontDeskDelayMs);
     },
     async markBooked(clientId) {
+      calls.log.push(`markBooked:${clientId}`);
       calls.booked.push(clientId);
       if (opts.markBookedDelayMs) await delay(opts.markBookedDelayMs);
     },
     async recordOptOut(clientId) {
+      calls.log.push(`recordOptOut:${clientId}`);
       calls.optOuts.push(clientId);
     },
   };
@@ -79,6 +117,12 @@ function mockActivities(opts: MockOptions) {
 
 const kindsTo = (calls: Calls, clientId: string) => calls.texts.filter((t) => t.clientId === clientId).map((t) => t.kind);
 const frontDeskKinds = (calls: Calls) => calls.frontDesk.map((n) => n.kind);
+const clientIds = (xs: { clientId: string }[]) => xs.map((x) => x.clientId);
+const before_ = (calls: Calls, a: string, b: string) => {
+  const ia = calls.log.indexOf(a);
+  const ib = calls.log.indexOf(b);
+  assert.ok(ia >= 0 && ib >= 0 && ia < ib, `expected "${a}" before "${b}" in ${JSON.stringify(calls.log)}`);
+};
 
 // ---------------------------------------------------------------------------
 // Status helpers
@@ -91,6 +135,7 @@ function candidate(s: OpeningStatus, id: string): Candidate {
   return c;
 }
 const stateOf = (s: OpeningStatus, id: string) => candidate(s, id).state;
+const states = (s: OpeningStatus) => s.candidates.map((c) => [c.id, c.state]);
 const offeredIds = (s: OpeningStatus) => s.candidates.filter((c) => c.state === "offered").map((c) => c.id);
 const attentionSummary = (s: OpeningStatus) =>
   s.attention.map(({ clientId, kind, resolved }) => ({ clientId, kind, resolved }));
@@ -102,11 +147,14 @@ const holds = (id: string) => (s: OpeningStatus) => {
 };
 
 // Checked on every status the tests see: at most one client holds the offer,
-// and currentClientId names exactly that client.
-function assertOneOfferAtATime(s: OpeningStatus): void {
+// currentClientId (when set) is that client, and nothing is wrapped up early.
+function assertStatusInvariants(s: OpeningStatus): void {
   const offered = offeredIds(s);
   assert.ok(offered.length <= 1, `more than one client holds the offer: ${offered.join(", ")}`);
-  assert.equal(s.currentClientId, offered[0], "currentClientId should be the one client holding the offer");
+  if (s.currentClientId !== undefined) {
+    assert.deepEqual(offered, [s.currentClientId], "currentClientId should be the one client holding the offer");
+  }
+  if (s.phase === "finding" || s.phase === "offering") assert.equal(s.wrappedUp, false, "wrappedUp while still offering");
 }
 
 // Polls the query (in real time; queries do not skip time) until `done` holds.
@@ -123,7 +171,7 @@ async function waitForStatus(handle: Handle, label: string, done: (s: OpeningSta
     }
     if (s) {
       last = s;
-      assertOneOfferAtATime(s);
+      assertStatusInvariants(s);
       if (done(s)) return s;
     }
     if (Date.now() > deadline) {
@@ -137,8 +185,17 @@ const waitUntilHolding = (handle: Handle, id: string) => waitForStatus(handle, `
 
 async function query(handle: Handle): Promise<OpeningStatus> {
   const s = await handle.query(getOpeningStatus);
-  assertOneOfferAtATime(s);
+  assertStatusInvariants(s);
   return s;
+}
+
+// Awaits the result (this lets the time-skipping server skip time) and checks the closing state.
+async function finish(handle: Handle): Promise<OpeningStatus> {
+  const final = await handle.result();
+  assertStatusInvariants(final);
+  assert.equal(final.wrappedUp, true, "the returned status should be wrapped up");
+  assert.equal(final.currentClientId, undefined);
+  return final;
 }
 
 async function reply(handle: Handle, clientId: string, text: string, by: ReplyInput["by"] = "client"): Promise<ReplyOutcome> {
@@ -179,26 +236,32 @@ after(async () => {
   await env?.teardown();
 });
 
-type Run = { handle: Handle; calls: Calls; openingId: string };
+type Run = { handle: Handle; calls: Calls; openingId: string; startAgain: () => Promise<unknown> };
 
-async function runOpening(name: string, opts: MockOptions, scenario: (run: Run) => Promise<void>): Promise<void> {
+async function runOpening(
+  name: string,
+  opts: MockOptions & { opening?: Partial<Opening> },
+  scenario: (run: Run) => Promise<void>,
+): Promise<void> {
   const id = `${name}-${randomUUID()}`;
   const { calls, activities } = mockActivities(opts);
+  const input: OpeningInput = { opening: { ...OPENING, ...opts.opening, id }, policy: POLICY };
+  const start = () => env.client.workflow.start(fillOpeningWorkflow, { workflowId: id, taskQueue: id, args: [input] });
   const worker = await Worker.create({ connection: env.nativeConnection, taskQueue: id, workflowBundle, activities });
   await worker.runUntil(async () => {
-    const handle = await env.client.workflow.start(fillOpeningWorkflow, {
-      workflowId: id,
-      taskQueue: id,
-      args: [{ opening: { ...OPENING, id }, policy: POLICY }],
-    });
+    const handle = await start();
     try {
-      await scenario({ handle, calls, openingId: id });
+      await scenario({ handle, calls, openingId: id, startAgain: start });
     } catch (err) {
       // Don't leave a running workflow (and its hold timer) behind for later tests.
       await handle.terminate("test failed").catch(() => undefined);
       throw err;
     }
   });
+  // Every bookkeeping call, text and note was for this opening.
+  for (const x of [...calls.startOffers, ...calls.endOffers, ...calls.texts, ...calls.undelivered, ...calls.frontDesk]) {
+    assert.equal(x.openingId, id);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -225,22 +288,21 @@ test("first yes wins: ann accepts, the opening is filled once and nobody else is
     await assert.rejects(reply(handle, "bob", "yes"), rejectedAsNotOffered);
 
     assert.equal(await reply(handle, "ann", "yes"), "accepted");
-    const final = await handle.result();
+    const final = await finish(handle);
 
     assert.equal(final.phase, "filled");
     assert.equal(final.bookedClientId, "ann");
-    assert.equal(final.currentClientId, undefined);
-    assert.deepEqual(
-      final.candidates.map((c) => [c.id, c.state]),
-      [["ann", "booked"], ["bob", "in_line"], ["cat", "in_line"]],
-    );
+    assert.deepEqual(states(final), [["ann", "booked"], ["bob", "in_line"], ["cat", "in_line"]]);
     assert.deepEqual(calls.matched.map((o) => o.id), [openingId]);
     assert.deepEqual(calls.booked, ["ann"]);
+    assert.deepEqual(clientIds(calls.startOffers), ["ann"]);
+    assert.deepEqual(clientIds(calls.endOffers), ["ann"]);
+    before_(calls, "startOffer:ann:ok", "sendText:ann:offer");
+    before_(calls, "markBooked:ann", "endOffer:ann");
     assert.deepEqual(kindsTo(calls, "ann"), ["offer", "confirmed"]);
     assert.deepEqual(kindsTo(calls, "bob"), []);
     assert.deepEqual(kindsTo(calls, "cat"), []);
     assert.deepEqual(frontDeskKinds(calls), ["filled"]);
-    assert.ok(calls.frontDesk.every((n) => n.openingId === openingId));
     assert.deepEqual(calls.optOuts, []);
   }),
 );
@@ -253,11 +315,13 @@ test("no reply moves the offer on after 15 minutes; ann's late yes is turned awa
     let s = await query(handle);
     assert.ok(holds("ann")(s), "ann should still hold the offer after 14 minutes");
     assert.deepEqual(kindsTo(calls, "bob"), []);
+    assert.deepEqual(clientIds(calls.endOffers), []);
 
     await env.sleep("2 minutes"); // 16 minutes in total
     s = await waitUntilHolding(handle, "bob");
     assert.equal(stateOf(s, "ann"), "timed_out");
     assert.deepEqual(offeredIds(s), ["bob"]);
+    before_(calls, "endOffer:ann", "startOffer:bob:ok");
 
     assert.equal(await reply(handle, "ann", "yes"), "too_late");
     assert.deepEqual(kindsTo(calls, "ann"), ["offer", "too_late"]);
@@ -266,14 +330,13 @@ test("no reply moves the offer on after 15 minutes; ann's late yes is turned awa
     assert.equal(stateOf(s, "ann"), "timed_out");
 
     assert.equal(await reply(handle, "bob", "YES"), "accepted");
-    const final = await handle.result();
+    const final = await finish(handle);
 
     assert.equal(final.phase, "filled");
     assert.equal(final.bookedClientId, "bob");
-    assert.equal(stateOf(final, "ann"), "timed_out");
-    assert.equal(stateOf(final, "bob"), "booked");
-    assert.equal(stateOf(final, "cat"), "in_line");
+    assert.deepEqual(states(final), [["ann", "timed_out"], ["bob", "booked"], ["cat", "in_line"]]);
     assert.deepEqual(calls.booked, ["bob"]);
+    assert.deepEqual(clientIds(calls.endOffers), ["ann", "bob"]);
     // ann already heard it's gone (one too_late text), so she gets no separate "filled" text.
     assert.deepEqual(kindsTo(calls, "ann"), ["offer", "too_late"]);
     assert.deepEqual(kindsTo(calls, "bob"), ["offer", "confirmed"]);
@@ -289,11 +352,12 @@ test("a timed-out client who never replied late is told once the opening is fill
     await waitUntilHolding(handle, "bob");
 
     assert.equal(await reply(handle, "bob", "yes"), "accepted");
-    const final = await handle.result();
+    const final = await finish(handle);
 
     assert.equal(final.phase, "filled");
     assert.equal(final.bookedClientId, "bob");
     assert.equal(stateOf(final, "ann"), "timed_out");
+    assert.deepEqual(clientIds(calls.endOffers), ["ann", "bob"]);
     assert.deepEqual(kindsTo(calls, "ann"), ["offer", "filled"]);
     assert.deepEqual(kindsTo(calls, "bob"), ["offer", "confirmed"]);
     assert.deepEqual(kindsTo(calls, "cat"), []);
@@ -319,17 +383,16 @@ test("everyone passes: ann declines, bob times out, cat declines, so the opening
     assert.equal(stateOf(s, "bob"), "timed_out");
 
     assert.equal(await reply(handle, "cat", "no"), "declined");
-    const final = await handle.result();
+    const final = await finish(handle);
 
     assert.equal(final.phase, "unfilled");
-    assert.equal(final.currentClientId, undefined);
     assert.equal(final.bookedClientId, undefined);
-    assert.deepEqual(
-      final.candidates.map((c) => [c.id, c.state]),
-      [["ann", "declined"], ["bob", "timed_out"], ["cat", "declined"]],
-    );
+    assert.equal(final.endReason, undefined);
+    assert.deepEqual(states(final), [["ann", "declined"], ["bob", "timed_out"], ["cat", "declined"]]);
     assert.deepEqual(frontDeskKinds(calls), ["unfilled"]);
     assert.deepEqual(calls.booked, []);
+    assert.deepEqual(clientIds(calls.startOffers), ["ann", "bob", "cat"]);
+    assert.deepEqual(clientIds(calls.endOffers), ["ann", "bob", "cat"]);
     assert.deepEqual(kindsTo(calls, "ann"), ["offer", "declined"]);
     assert.deepEqual(kindsTo(calls, "bob"), ["offer"]);
     assert.deepEqual(kindsTo(calls, "cat"), ["offer", "declined"]);
@@ -340,16 +403,14 @@ test("staff cancel while ann holds the offer withdraws it and nobody else is off
   runOpening("cancel", {}, async ({ handle, calls }) => {
     await waitUntilHolding(handle, "ann");
     await handle.signal(cancelOpening, "stylist unavailable");
-    const final = await handle.result();
+    const final = await finish(handle);
 
     assert.equal(final.phase, "cancelled");
     assert.equal(final.cancelReason, "stylist unavailable");
-    assert.equal(final.currentClientId, undefined);
     assert.equal(final.bookedClientId, undefined);
-    assert.deepEqual(
-      final.candidates.map((c) => [c.id, c.state]),
-      [["ann", "withdrawn"], ["bob", "in_line"], ["cat", "in_line"]],
-    );
+    assert.deepEqual(states(final), [["ann", "withdrawn"], ["bob", "in_line"], ["cat", "in_line"]]);
+    assert.deepEqual(clientIds(calls.startOffers), ["ann"]);
+    assert.deepEqual(clientIds(calls.endOffers), ["ann"]);
     assert.deepEqual(kindsTo(calls, "ann"), ["offer", "withdrawn"]);
     assert.deepEqual(kindsTo(calls, "bob"), []);
     assert.deepEqual(kindsTo(calls, "cat"), []);
@@ -359,7 +420,7 @@ test("staff cancel while ann holds the offer withdraws it and nobody else is off
 );
 
 test("a text that is not delivered marks ann unreachable, flags staff, and offers bob next", { timeout: TEST_TIMEOUT }, () =>
-  runOpening("not-delivered", { undeliverableTo: ["ann"] }, async ({ handle, calls }) => {
+  runOpening("not-delivered", { undeliverable: (t) => t.clientId === "ann" }, async ({ handle, calls }) => {
     const s = await waitUntilHolding(handle, "bob");
     assert.equal(stateOf(s, "ann"), "unreachable");
     // Non-retryable failure: exactly one attempt, then the offer moves on.
@@ -368,9 +429,13 @@ test("a text that is not delivered marks ann unreachable, flags staff, and offer
     assert.deepEqual(kindsTo(calls, "bob"), ["offer"]);
     assert.deepEqual(attentionSummary(s), [{ clientId: "ann", kind: "not_delivered", resolved: false }]);
     assert.deepEqual(frontDeskKinds(calls), ["attention"]);
+    assert.deepEqual(clientIds(calls.endOffers), ["ann"]);
+
+    // ann never received the offer, so a reply from her is refused.
+    await assert.rejects(reply(handle, "ann", "yes"), rejectedAsNotOffered);
 
     assert.equal(await reply(handle, "bob", "yes"), "accepted");
-    const final = await handle.result();
+    const final = await finish(handle);
 
     assert.equal(final.phase, "filled");
     assert.equal(final.bookedClientId, "bob");
@@ -378,6 +443,7 @@ test("a text that is not delivered marks ann unreachable, flags staff, and offer
     assert.deepEqual(attentionSummary(final), [{ clientId: "ann", kind: "not_delivered", resolved: false }]);
     assert.deepEqual(frontDeskKinds(calls), ["attention", "filled"]);
     assert.deepEqual(calls.booked, ["bob"]);
+    assert.deepEqual(clientIds(calls.endOffers), ["ann", "bob"]);
     assert.equal(calls.undelivered.length, 1);
     assert.deepEqual(kindsTo(calls, "bob"), ["offer", "confirmed"]);
   }),
@@ -395,7 +461,7 @@ test("an unclear reply asks again and flags staff; staff can then enter ann's YE
     assert.deepEqual(attentionSummary(s), [{ clientId: "ann", kind: "unclear_reply", resolved: false }]);
 
     assert.equal(await reply(handle, "ann", "YES", "staff"), "accepted");
-    const final = await handle.result();
+    const final = await finish(handle);
 
     assert.equal(final.phase, "filled");
     assert.equal(final.bookedClientId, "ann");
@@ -403,6 +469,7 @@ test("an unclear reply asks again and flags staff; staff can then enter ann's YE
     assert.deepEqual(attentionSummary(final), [{ clientId: "ann", kind: "unclear_reply", resolved: true }]);
     assert.ok(final.history.some((h) => h.text.includes("(entered by staff)")));
     assert.deepEqual(calls.booked, ["ann"]);
+    assert.deepEqual(clientIds(calls.endOffers), ["ann"]);
     assert.deepEqual(kindsTo(calls, "ann"), ["offer", "unclear", "confirmed"]);
     assert.deepEqual(kindsTo(calls, "bob"), []);
     assert.deepEqual(frontDeskKinds(calls), ["filled"]);
@@ -421,7 +488,7 @@ test("STOP opts ann out and moves the offer to bob", { timeout: TEST_TIMEOUT }, 
     assert.deepEqual(kindsTo(calls, "ann"), ["offer", "opted_out"]);
 
     assert.equal(await reply(handle, "bob", "yes"), "accepted");
-    const final = await handle.result();
+    const final = await finish(handle);
 
     assert.equal(final.phase, "filled");
     assert.equal(final.bookedClientId, "bob");
@@ -429,6 +496,7 @@ test("STOP opts ann out and moves the offer to bob", { timeout: TEST_TIMEOUT }, 
     assert.equal(stateOf(final, "bob"), "booked");
     assert.deepEqual(calls.optOuts, ["ann"]);
     assert.deepEqual(calls.booked, ["bob"]);
+    assert.deepEqual(clientIds(calls.endOffers), ["ann", "bob"]);
     assert.deepEqual(kindsTo(calls, "ann"), ["offer", "opted_out"]);
     assert.deepEqual(kindsTo(calls, "bob"), ["offer", "confirmed"]);
   }),
@@ -445,14 +513,16 @@ test("regression: a second YES from ann while her booking is being recorded gets
     assert.equal(await reply(handle, "ann", "yes"), "accepted");
     const s = await waitUntilWrappingUp(handle, calls);
     assert.equal(s.bookedClientId, "ann");
+    assert.equal(s.wrappedUp, false);
 
     assert.equal(await reply(handle, "ann", "YES"), "already_booked");
-    const final = await handle.result();
+    const final = await finish(handle);
 
     assert.equal(final.phase, "filled");
     assert.equal(final.bookedClientId, "ann");
     assert.equal(stateOf(final, "ann"), "booked");
     assert.deepEqual(calls.booked, ["ann"]);
+    assert.deepEqual(clientIds(calls.endOffers), ["ann"]);
     assert.ok(!kindsTo(calls, "ann").includes("too_late"), "ann must not be told the opening is gone");
     assert.deepEqual(kindsTo(calls, "ann"), ["offer", "already_booked", "confirmed"]);
     assert.match(calls.texts.find((t) => t.kind === "already_booked")!.body, /^You're already booked:/);
@@ -473,15 +543,235 @@ test("regression: STOP from ann after she booked records the opt-out but keeps h
     assert.equal(stateOf(s, "ann"), "booked");
     assert.equal(s.bookedClientId, "ann");
 
-    const final = await handle.result();
+    const final = await finish(handle);
 
     assert.equal(final.phase, "filled");
     assert.equal(final.bookedClientId, "ann");
     assert.equal(stateOf(final, "ann"), "booked");
     assert.deepEqual(calls.booked, ["ann"]);
     assert.deepEqual(calls.optOuts, ["ann"]);
+    assert.deepEqual(clientIds(calls.endOffers), ["ann"]);
     assert.deepEqual(kindsTo(calls, "ann"), ["offer", "opted_out", "confirmed"]);
     assert.deepEqual(kindsTo(calls, "bob"), []);
     assert.deepEqual(frontDeskKinds(calls), ["filled"]);
+  }),
+);
+
+// --- startOffer: the waitlist can change while an opening runs -------------
+
+test("startOffer says ann opted out and bob is already booked: both are skipped without a text and cat is offered", { timeout: TEST_TIMEOUT }, () =>
+  runOpening("skip", { offerChecks: { ann: ["opted_out"], bob: ["booked"] } }, async ({ handle, calls }) => {
+    const s = await waitUntilHolding(handle, "cat");
+    assert.equal(stateOf(s, "ann"), "skipped");
+    assert.equal(candidate(s, "ann").note, "opted out of texts");
+    assert.equal(stateOf(s, "bob"), "skipped");
+    assert.equal(candidate(s, "bob").note, "already booked by another opening");
+    assert.deepEqual(kindsTo(calls, "ann"), []);
+    assert.deepEqual(kindsTo(calls, "bob"), []);
+    assert.deepEqual(kindsTo(calls, "cat"), ["offer"]);
+
+    // Skipped clients never got this opening's offer, so their replies are refused.
+    await assert.rejects(reply(handle, "ann", "yes"), rejectedAsNotOffered);
+    await assert.rejects(reply(handle, "bob", "yes"), rejectedAsNotOffered);
+
+    assert.equal(await reply(handle, "cat", "yes"), "accepted");
+    const final = await finish(handle);
+
+    assert.equal(final.phase, "filled");
+    assert.equal(final.bookedClientId, "cat");
+    assert.deepEqual(states(final), [["ann", "skipped"], ["bob", "skipped"], ["cat", "booked"]]);
+    assert.deepEqual(calls.startOffers.map((c) => [c.clientId, c.result]), [["ann", "opted_out"], ["bob", "booked"], ["cat", "ok"]]);
+    // Only cat's turn started, so only cat's ends.
+    assert.deepEqual(clientIds(calls.endOffers), ["cat"]);
+    assert.deepEqual(kindsTo(calls, "ann"), []);
+    assert.deepEqual(kindsTo(calls, "bob"), []);
+    assert.deepEqual(kindsTo(calls, "cat"), ["offer", "confirmed"]);
+    assert.deepEqual(calls.booked, ["cat"]);
+  }),
+);
+
+test("startOffer says ann is busy: she moves to the back of the queue, bob and cat go first, then she is offered", { timeout: TEST_TIMEOUT }, () =>
+  runOpening("busy", { offerChecks: { ann: ["busy", "ok"] } }, async ({ handle, calls }) => {
+    let s = await waitUntilHolding(handle, "bob");
+    assert.equal(stateOf(s, "ann"), "in_line");
+    assert.deepEqual(kindsTo(calls, "ann"), []);
+
+    assert.equal(await reply(handle, "bob", "no"), "declined");
+    s = await waitUntilHolding(handle, "cat");
+    assert.equal(stateOf(s, "ann"), "in_line");
+
+    assert.equal(await reply(handle, "cat", "no"), "declined");
+    s = await waitUntilHolding(handle, "ann");
+    assert.deepEqual(kindsTo(calls, "ann"), ["offer"]);
+
+    assert.equal(await reply(handle, "ann", "yes"), "accepted");
+    const final = await finish(handle);
+
+    assert.equal(final.phase, "filled");
+    assert.equal(final.bookedClientId, "ann");
+    assert.deepEqual(states(final), [["ann", "booked"], ["bob", "declined"], ["cat", "declined"]]);
+    assert.deepEqual(calls.startOffers.map((c) => [c.clientId, c.result]), [["ann", "busy"], ["bob", "ok"], ["cat", "ok"], ["ann", "ok"]]);
+    assert.deepEqual(clientIds(calls.endOffers), ["bob", "cat", "ann"]);
+    assert.ok(final.history.some((h) => h.text.includes("answering another opening's offer")));
+    assert.deepEqual(kindsTo(calls, "ann"), ["offer", "confirmed"]);
+  }),
+);
+
+test("a client still busy on the second try is skipped", { timeout: TEST_TIMEOUT }, () =>
+  runOpening("busy-twice", { offerChecks: { ann: ["busy", "busy"] } }, async ({ handle, calls }) => {
+    await waitUntilHolding(handle, "bob");
+    assert.equal(await reply(handle, "bob", "no"), "declined");
+    await waitUntilHolding(handle, "cat");
+    assert.equal(await reply(handle, "cat", "no"), "declined");
+    const final = await finish(handle);
+
+    assert.equal(final.phase, "unfilled");
+    assert.equal(final.endReason, undefined);
+    assert.deepEqual(states(final), [["ann", "skipped"], ["bob", "declined"], ["cat", "declined"]]);
+    assert.equal(candidate(final, "ann").note, "still answering another opening's offer");
+    assert.deepEqual(calls.startOffers.map((c) => [c.clientId, c.result]), [["ann", "busy"], ["bob", "ok"], ["cat", "ok"], ["ann", "busy"]]);
+    assert.deepEqual(clientIds(calls.endOffers), ["bob", "cat"]);
+    assert.deepEqual(kindsTo(calls, "ann"), []);
+    assert.deepEqual(frontDeskKinds(calls), ["unfilled"]);
+  }),
+);
+
+// --- Appointment-time cutoff ---------------------------------------------------
+
+test("cutoff: holds never run past the appointment start and nobody is offered after it", { timeout: TEST_TIMEOUT }, async () => {
+  // Use the test server's own clock: earlier tests have skipped it ahead of real time.
+  const startsAt = (await env.currentTimeMs()) + 20 * MINUTE;
+  await runOpening("cutoff", { opening: { startsAt } }, async ({ handle, calls }) => {
+    let s = await waitUntilHolding(handle, "ann");
+    const ann = candidate(s, "ann");
+    assert.equal(ann.expiresAt! - ann.offeredAt!, 15 * MINUTE, "ann gets the full 15-minute hold");
+
+    await env.sleep("16 minutes");
+    s = await waitUntilHolding(handle, "bob");
+    assert.equal(stateOf(s, "ann"), "timed_out");
+    const bob = candidate(s, "bob");
+    assert.equal(bob.expiresAt, startsAt, "bob's hold ends when the appointment starts");
+    assert.ok(bob.expiresAt! - bob.offeredAt! <= 5 * MINUTE, `bob's hold should be capped at 5 minutes, got ${(bob.expiresAt! - bob.offeredAt!) / MINUTE}`);
+
+    // 6 more minutes passes the appointment start: bob's hold has run out and cat is never offered.
+    await env.sleep("6 minutes");
+    await waitForStatus(handle, "the opening to be unfilled", (x) => x.phase === "unfilled");
+    const final = await finish(handle);
+
+    assert.equal(final.phase, "unfilled");
+    assert.equal(final.endReason, "the appointment time arrived");
+    assert.deepEqual(states(final), [["ann", "timed_out"], ["bob", "timed_out"], ["cat", "in_line"]]);
+    assert.deepEqual(clientIds(calls.startOffers), ["ann", "bob"]);
+    assert.deepEqual(clientIds(calls.endOffers), ["ann", "bob"]);
+    assert.deepEqual(kindsTo(calls, "ann"), ["offer"]);
+    assert.deepEqual(kindsTo(calls, "bob"), ["offer"]);
+    assert.deepEqual(kindsTo(calls, "cat"), []);
+    assert.deepEqual(frontDeskKinds(calls), ["unfilled"]);
+    assert.match(calls.frontDesk[0].message, /appointment time arrived/);
+  });
+});
+
+// --- Texts after a decision never fail the opening ----------------------------
+
+test("a confirmation text that can't be delivered flags staff, but the opening is still filled", { timeout: TEST_TIMEOUT }, () =>
+  runOpening("confirm-undelivered", { undeliverable: (t) => t.kind === "confirmed" }, async ({ handle, calls }) => {
+    await waitUntilHolding(handle, "ann");
+    assert.equal(await reply(handle, "ann", "yes"), "accepted");
+    const final = await finish(handle);
+
+    assert.equal(final.phase, "filled");
+    assert.equal(final.bookedClientId, "ann");
+    assert.equal(stateOf(final, "ann"), "booked");
+    assert.deepEqual(attentionSummary(final), [{ clientId: "ann", kind: "not_delivered", resolved: false }]);
+    assert.deepEqual(frontDeskKinds(calls), ["attention", "filled"]);
+    assert.deepEqual(calls.undelivered.map((t) => [t.clientId, t.kind]), [["ann", "confirmed"]]);
+    assert.deepEqual(kindsTo(calls, "ann"), ["offer"]);
+    assert.deepEqual(calls.booked, ["ann"]);
+    assert.deepEqual(clientIds(calls.endOffers), ["ann"]);
+  }),
+);
+
+// --- wrappedUp -------------------------------------------------------------------
+
+test("wrappedUp stays false until the closing texts and front desk note are done", { timeout: TEST_TIMEOUT }, () =>
+  runOpening("wrapped-up", { frontDeskDelayMs: 1_000 }, async ({ handle, calls }) => {
+    let s = await waitUntilHolding(handle, "ann");
+    assert.equal(s.wrappedUp, false);
+
+    assert.equal(await reply(handle, "ann", "yes"), "accepted");
+    // The "filled" front desk note is still being written.
+    s = await waitForStatus(handle, "the filled note to be in progress", (x) => x.phase === "filled" && calls.frontDesk.length > 0);
+    assert.equal(s.wrappedUp, false);
+    assert.deepEqual(kindsTo(calls, "ann"), ["offer", "confirmed"]);
+
+    const final = await finish(handle);
+    assert.equal(final.wrappedUp, true);
+    assert.deepEqual(frontDeskKinds(calls), ["filled"]);
+  }),
+);
+
+// --- Unclear replies settle themselves when the turn ends -----------------------
+
+test("an unresolved unclear reply is resolved automatically when that client's turn ends", { timeout: TEST_TIMEOUT }, () =>
+  runOpening("unclear-auto", {}, async ({ handle, calls }) => {
+    await waitUntilHolding(handle, "ann");
+    assert.equal(await reply(handle, "ann", "maybe later?"), "unclear");
+    let s = await query(handle);
+    assert.deepEqual(attentionSummary(s), [{ clientId: "ann", kind: "unclear_reply", resolved: false }]);
+
+    // ann's time runs out without a clear answer.
+    await env.sleep("16 minutes");
+    s = await waitUntilHolding(handle, "bob");
+    assert.equal(stateOf(s, "ann"), "timed_out");
+    assert.deepEqual(attentionSummary(s), [{ clientId: "ann", kind: "unclear_reply", resolved: true }]);
+
+    // bob is unclear, then declines.
+    assert.equal(await reply(handle, "bob", "what time?"), "unclear");
+    s = await query(handle);
+    assert.deepEqual(attentionSummary(s), [
+      { clientId: "ann", kind: "unclear_reply", resolved: true },
+      { clientId: "bob", kind: "unclear_reply", resolved: false },
+    ]);
+    assert.equal(await reply(handle, "bob", "no"), "declined");
+    s = await waitUntilHolding(handle, "cat");
+    assert.equal(stateOf(s, "bob"), "declined");
+    assert.deepEqual(attentionSummary(s), [
+      { clientId: "ann", kind: "unclear_reply", resolved: true },
+      { clientId: "bob", kind: "unclear_reply", resolved: true },
+    ]);
+
+    assert.equal(await reply(handle, "cat", "yes"), "accepted");
+    const final = await finish(handle);
+
+    assert.equal(final.phase, "filled");
+    assert.equal(final.bookedClientId, "cat");
+    assert.ok(final.attention.every((a) => a.resolved));
+    assert.deepEqual(clientIds(calls.endOffers), ["ann", "bob", "cat"]);
+    assert.deepEqual(kindsTo(calls, "ann"), ["offer", "unclear", "filled"]);
+    assert.deepEqual(kindsTo(calls, "bob"), ["offer", "unclear", "declined"]);
+    assert.deepEqual(kindsTo(calls, "cat"), ["offer", "confirmed"]);
+  }),
+);
+
+// --- One run per slot -------------------------------------------------------------
+
+test("starting the same opening again while it runs is refused with WorkflowExecutionAlreadyStartedError", { timeout: TEST_TIMEOUT }, () =>
+  runOpening("duplicate", {}, async ({ handle, calls, startAgain }) => {
+    await waitUntilHolding(handle, "ann");
+
+    await assert.rejects(startAgain(), WorkflowExecutionAlreadyStartedError);
+
+    // The first run carries on untouched.
+    const s = await query(handle);
+    assert.ok(holds("ann")(s), "ann should still hold the offer in the first run");
+    assert.equal(calls.matched.length, 1);
+    assert.deepEqual(clientIds(calls.startOffers), ["ann"]);
+
+    await handle.signal(cancelOpening, "test over");
+    const final = await finish(handle);
+    assert.equal(final.phase, "cancelled");
+    assert.equal(calls.matched.length, 1);
+    assert.deepEqual(kindsTo(calls, "ann"), ["offer", "withdrawn"]);
+    assert.deepEqual(clientIds(calls.endOffers), ["ann"]);
   }),
 );

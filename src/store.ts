@@ -5,7 +5,7 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { seedWaitlist } from "./seed";
-import type { FrontDeskNote, Settings, TextMessage, WaitlistClient } from "./types";
+import type { FrontDeskNote, OfferCheck, Settings, TextMessage, WaitlistClient } from "./types";
 
 const DATA_DIR = process.env.DATA_DIR ?? path.join(process.cwd(), "data");
 
@@ -35,6 +35,7 @@ export function ensureSeeded(): void {
 export function resetDemoData(): void {
   write("waitlist", seedWaitlist());
   write("openings", []);
+  write("offers", {});
   write("settings", { flakyTexts: false });
   for (const log of ["messages", "frontdesk"]) fs.rmSync(path.join(DATA_DIR, `${log}.jsonl`), { force: true });
 }
@@ -79,7 +80,28 @@ export function addFrontDeskNote(note: Omit<FrontDeskNote, "id" | "at">): void {
 
 export const getOpeningIds = (): string[] => read("openings", () => []);
 export function addOpeningId(id: string): void {
-  write("openings", [id, ...getOpeningIds()]);
+  write("openings", [id, ...getOpeningIds().filter((x) => x !== id)]);
+}
+
+// Which opening each client currently holds a live offer from. A client gets
+// one offer at a time, so a "YES" can only mean one thing.
+const getActiveOffers = (): Record<string, string> => read("offers", () => ({}));
+
+export function claimOffer(clientId: string, openingId: string): OfferCheck {
+  const client = getClient(clientId);
+  if (!client || client.optedOut) return "opted_out";
+  if (client.status === "booked") return "booked";
+  const offers = getActiveOffers();
+  if (offers[clientId] && offers[clientId] !== openingId) return "busy";
+  write("offers", { ...offers, [clientId]: openingId });
+  return "ok";
+}
+
+export function releaseOffer(clientId: string, openingId: string): void {
+  const offers = getActiveOffers();
+  if (offers[clientId] !== openingId) return;
+  delete offers[clientId];
+  write("offers", offers);
 }
 
 export const getSettings = (): Settings => read("settings", () => ({ flakyTexts: false }));

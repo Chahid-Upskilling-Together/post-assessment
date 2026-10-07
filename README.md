@@ -146,7 +146,7 @@ booking, confirmation and front desk note.
 ## Tests
 
 ```bash
-npm test          # 19 workflow tests on Temporal's time-skipping test server (no Docker needed)
+npm test          # 24 workflow tests on Temporal's time-skipping test server (no Docker needed)
 npm run typecheck # TypeScript
 ```
 
@@ -163,6 +163,9 @@ The tests cover:
   elsewhere, and trying a busy client again later
 - the cutoff at the appointment time
 - Temporal refusing a second run for the same slot
+- replies and cancels that arrive mid-step: a STOP while an offer is being
+  closed, and a cancel or the appointment start while the waitlist is being
+  checked
 
 ## Settings
 

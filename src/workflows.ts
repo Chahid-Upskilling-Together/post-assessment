@@ -168,11 +168,12 @@ export async function fillOpeningWorkflow({ opening, policy }: OpeningInput): Pr
 
   const queue = [...status.candidates];
   const deferred = new Set<string>();
+  const pastStart = () => opening.startsAt !== undefined && Date.now() >= opening.startsAt;
   let booked: Candidate | undefined;
   while (queue.length > 0 && !cancelReason) {
     const c = queue.shift()!;
     if (c.state !== "in_line") continue;
-    if (opening.startsAt !== undefined && Date.now() >= opening.startsAt) {
+    if (pastStart()) {
       status.endReason = "the appointment time arrived";
       break;
     }
@@ -191,14 +192,23 @@ export async function fillOpeningWorkflow({ opening, policy }: OpeningInput): Pr
       note(`Skipped ${c.name}: ${c.note}`);
       continue;
     }
+    // Checking took a moment: the opening may have been cancelled or started.
+    if (cancelReason || pastStart()) {
+      await endOffer(c.id, opening.id);
+      if (!cancelReason) status.endReason = "the appointment time arrived";
+      break;
+    }
 
+    // Hold for the agreed time, but never past the start of the appointment.
+    const holdFor = opening.startsAt === undefined ? holdMs : Math.min(holdMs, opening.startsAt - Date.now());
+    const holdLabel = Math.max(1, Math.round(holdFor / policy.minuteMs));
     status.currentClientId = c.id;
     c.state = "offered";
     try {
       await text(
         c,
         "offer",
-        `Hi ${firstName(c.name)}, it's Juniper Salon. A spot just opened: ${what}. Reply YES to take it or NO to pass. We'll hold it for you for ${holdMinutes} minutes.`,
+        `Hi ${firstName(c.name)}, it's Juniper Salon. A spot just opened: ${what}. Reply YES to take it or NO to pass. We'll hold it for you for ${holdLabel} minute${holdLabel === 1 ? "" : "s"}.`,
       );
     } catch {
       c.state = "unreachable";
@@ -217,36 +227,37 @@ export async function fillOpeningWorkflow({ opening, policy }: OpeningInput): Pr
     }
     contacted.add(c.id);
     c.offeredAt = Date.now();
-    // Hold for the agreed time, but never past the start of the appointment.
-    const untilStart = opening.startsAt === undefined ? holdMs : Math.max(0, opening.startsAt - c.offeredAt);
-    const holdFor = Math.min(holdMs, untilStart);
-    c.expiresAt = c.offeredAt + holdFor;
-    note(`Offered to ${c.name}; holding for ${holdMinutes} minutes`);
+    const remaining = opening.startsAt === undefined ? holdFor : Math.max(0, Math.min(holdFor, opening.startsAt - c.offeredAt));
+    c.expiresAt = c.offeredAt + remaining;
+    note(`Offered to ${c.name}; holding for ${holdLabel} minute${holdLabel === 1 ? "" : "s"}`);
 
     // Durable wait: survives restarts. Ends on a reply, a cancel, or the hold running out.
-    await condition(() => decisions.has(c.id) || cancelReason !== undefined, holdFor);
+    await condition(() => decisions.has(c.id) || cancelReason !== undefined, remaining);
     status.currentClientId = undefined;
     const decision = decisions.get(c.id);
-
     if (decision === "yes") {
       c.state = "booked";
       booked = c;
       break;
     }
-    await endOffer(c.id, opening.id);
-    resolveAttention(c.id, "unclear_reply"); // their turn is over; nothing left to settle
+    // Settle their state before the next await, so a reply arriving meanwhile
+    // (a STOP, say) sees the final picture and isn't overwritten.
     if (decision === "no") {
       // The reply handler may have marked them opted out (they texted STOP).
       if ((c.state as Candidate["state"]) !== "opted_out") c.state = "declined";
-      continue;
-    }
-    if (cancelReason) {
+    } else if (cancelReason) {
       c.state = "withdrawn";
-      await tryText(c, "withdrawn", `Sorry, the ${what} is no longer available, so there's nothing you need to do. You're still on our waitlist.`);
-      break;
+    } else {
+      c.state = "timed_out";
+      note(`${c.name} didn't reply within ${holdLabel} minute${holdLabel === 1 ? "" : "s"}; moving on`);
     }
-    c.state = "timed_out";
-    note(`${c.name} didn't reply within ${holdMinutes} minutes; moving on`);
+    resolveAttention(c.id, "unclear_reply"); // their turn is over; nothing left to settle
+    await endOffer(c.id, opening.id);
+    // Tell them it's withdrawn, unless they opted out in the meantime.
+    if ((c.state as Candidate["state"]) === "withdrawn") {
+      await tryText(c, "withdrawn", `Sorry, the ${what} is no longer available, so there's nothing you need to do. You're still on our waitlist.`);
+    }
+    if (cancelReason) break;
   }
 
   if (booked) {
